@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>五子棋 vs Jev</title>
+<style>
+  body { font-family: system-ui, "Microsoft YaHei", sans-serif; background: #f4efe6;
+         display: flex; flex-direction: column; align-items: center; margin: 24px; color: #333; }
+  h1 { margin: 0 0 8px; font-size: 22px; }
+  #bar { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+  button, select { font-size: 14px; padding: 4px 12px; }
+  canvas { background: #e3b96b; border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,.2); cursor: pointer; }
+  #status { margin-top: 12px; font-size: 16px; min-height: 22px; }
+  #info { margin-top: 6px; font-size: 13px; color: #666; max-width: 600px; text-align: center; min-height: 18px; }
+</style>
+</head>
+<body>
+<h1>五子棋 vs Jev</h1>
+<div id="bar">
+  <label>我执 <select id="side"><option value="1">黑（先手）</option><option value="2">白（后手）</option></select></label>
+  <label>等级 <select id="level">
+    <option value="master">宗师 · 两路引擎 + Jev 裁决</option>
+    <option value="local">本地 · 不用 Jev</option>
+    <option value="assisted">辅助 · 启发式 + Jev 选</option>
+    <option value="pure">直觉 · 纯 Jev</option>
+  </select></label>
+  <button id="restart">重新开始</button>
+  <button id="undo">悔棋</button>
+</div>
+<canvas id="cv" width="600" height="600"></canvas>
+<div id="status"></div>
+<div id="info"></div>
+
+<script>
+const N = 15, CELL = 38, PAD = 34;
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const statusEl = document.getElementById("status"), infoEl = document.getElementById("info");
+const COLS = "ABCDEFGHIJKLMNO";
+let board, human, ai, turn, over, history, busy, mistakes, level, aiLog;
+
+function reset() {
+  board = Array.from({length: N}, () => Array(N).fill(0));
+  human = +document.getElementById("side").value;
+  ai = human === 1 ? 2 : 1;
+  turn = 1; over = false; history = []; busy = false; mistakes = [];
+  level = document.getElementById("level").value; aiLog = [];
+  infoEl.textContent = "";
+  draw();
+  if (turn === ai) aiTurn(); else setStatus(`轮到你下第 ${history.length + 1} 手`);
+}
+
+function setStatus(t) { statusEl.textContent = t; }
+
+function draw() {
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.strokeStyle = "#5a4020"; ctx.lineWidth = 1;
+  ctx.fillStyle = "#5a4020"; ctx.font = "12px sans-serif"; ctx.textAlign = "center";
+  for (let i = 0; i < N; i++) {
+    const p = PAD + i * CELL;
+    ctx.beginPath(); ctx.moveTo(PAD, p); ctx.lineTo(PAD + (N-1)*CELL, p); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(p, PAD); ctx.lineTo(p, PAD + (N-1)*CELL); ctx.stroke();
+    ctx.fillText(COLS[i], p, PAD - 16);
+    ctx.fillText(i + 1, PAD - 20, p + 4);
+  }
+  for (const [r, c] of [[3,3],[3,11],[7,7],[11,3],[11,11]]) {
+    ctx.beginPath(); ctx.arc(PAD + c*CELL, PAD + r*CELL, 4, 0, 7); ctx.fill();
+  }
+  history.forEach(([r, c], i) => {
+    const x = PAD + c*CELL, y = PAD + r*CELL;
+    const black = board[r][c] === 1;
+    const g = ctx.createRadialGradient(x-5, y-5, 2, x, y, 16);
+    if (black) { g.addColorStop(0, "#666"); g.addColorStop(1, "#000"); }
+    else { g.addColorStop(0, "#fff"); g.addColorStop(1, "#ccc"); }
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(x, y, 16, 0, 7); ctx.fill();
+    // 棋子上标手数，最后一手标红
+    ctx.fillStyle = i === history.length - 1 ? "#e33" : (black ? "#fff" : "#000");
+    ctx.font = "bold 12px sans-serif";
+    ctx.fillText(i + 1, x, y + 4);
+  });
+}
+
+function recordGame(winner) {
+  fetch("/record", {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({human, winner, mistakes, level, jev_calls: aiLog.filter(x => x.jev).length, ai_moves: aiLog.length, moves: history.map(([r, c]) => COLS[c] + (r + 1))})});
+}
+
+function isFive(r, c, who) {
+  for (const [dr, dc] of [[0,1],[1,0],[1,1],[1,-1]]) {
+    let n = 1;
+    for (const s of [1, -1]) {
+      let rr = r + dr*s, cc = c + dc*s;
+      while (rr >= 0 && rr < N && cc >= 0 && cc < N && board[rr][cc] === who) { n++; rr += dr*s; cc += dc*s; }
+    }
+    if (n >= 5) return true;
+  }
+  return false;
+}
+
+function place(r, c, who) {
+  board[r][c] = who; history.push([r, c]); turn = who === 1 ? 2 : 1; draw();
+  if (isFive(r, c, who)) {
+    over = true;
+    setStatus(`${who === human ? "🎉 你赢了！" : "AI 赢了"}  共 ${history.length} 手`);
+    recordGame(who === human ? "human" : "ai");
+    return;
+  }
+  if (history.length === N*N) { over = true; setStatus(`平局  共 ${history.length} 手`); recordGame("draw"); }
+}
+
+async function aiTurn() {
+  busy = true; setStatus(level === "local" ? "本地引擎计算中…" : "Jev 思考中…");
+  try {
+    const res = await fetch("/move", {method: "POST", headers: {"Content-Type": "application/json"},
+                                      body: JSON.stringify({board, ai, level})});
+    const d = await res.json();
+    const i = d.info;
+    aiLog.push({move: history.length + 1, jev: !!i.jev_called});
+    if (i.summary) {
+      infoEl.textContent = `第 ${history.length + 1} 手：${i.summary}　|　本局 Jev 参与 ${aiLog.filter(x => x.jev).length}/${aiLog.length} 步`;
+    } else if (i.mode === "pure") {
+      const top = i.top3.map(([k, p]) => `${k} ${(p*100).toFixed(0)}%`).join("、");
+      let t = `第 ${history.length + 1} 手：Jev 从 ${i.options} 个点中选了 ${i.choice}（置信度 ${(i.confidence*100).toFixed(0)}%；前三：${top}）`;
+      if (i.mistake) { t += `  ❌ ${i.mistake}`; mistakes.push({move: history.length + 1, what: i.mistake}); }
+      infoEl.textContent = t;
+    } else if (i.source === "jev") {
+      const conf = i.confidence != null ? `，置信度 ${(i.confidence*100).toFixed(0)}%` : "";
+      infoEl.textContent = `Jev 从 [${i.candidates.join(", ")}] 中选了 ${i.choice}${conf}`;
+    } else {
+      infoEl.textContent = `${i.source === "local" ? "本地规则" : "启发式兜底"}：${i.reason}`;
+    }
+    place(d.row, d.col, ai);
+    if (!over) setStatus(`轮到你下第 ${history.length + 1} 手`);
+  } catch (e) {
+    setStatus("AI 请求失败：" + e);
+  }
+  busy = false;
+}
+
+cv.addEventListener("click", e => {
+  if (over || busy || turn !== human) return;
+  const rect = cv.getBoundingClientRect();
+  const c = Math.round((e.clientX - rect.left - PAD) / CELL);
+  const r = Math.round((e.clientY - rect.top - PAD) / CELL);
+  if (r < 0 || r >= N || c < 0 || c >= N || board[r][c]) return;
+  place(r, c, human);
+  if (!over) aiTurn();
+});
+
+document.getElementById("restart").onclick = reset;
+document.getElementById("side").onchange = reset;
+document.getElementById("level").onchange = reset;
+document.getElementById("undo").onclick = () => {
+  if (busy) return;
+  // 撤回到上一次轮到人类
+  do {
+    const m = history.pop(); if (!m) break;
+    board[m[0]][m[1]] = 0;
+  } while (history.length && (history.length % 2 === (human === 1 ? 1 : 0)));
+  turn = history.length % 2 === 0 ? 1 : 2;
+  mistakes = mistakes.filter(m => m.move <= history.length);
+  aiLog = aiLog.filter(m => m.move <= history.length);
+  over = false; draw();
+  if (turn === ai) aiTurn(); else setStatus(`轮到你下第 ${history.length + 1} 手`);
+};
+
+reset();
+</script>
+</body>
+</html>

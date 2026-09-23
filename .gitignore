@@ -1,0 +1,9 @@
+# 含 API key，绝不提交
+config.py
+
+__pycache__/
+*.pyc
+
+# 本地对局 / 实验记录
+*.log
+*.jsonl
