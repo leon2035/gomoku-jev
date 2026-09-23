@@ -50,6 +50,8 @@ TOP_K = 8
 JEV_MODE = os.environ.get("JEV_MODE", "master")
 # grid: 只给棋盘文字图；lines: 额外列出每条有子的横/竖/斜线
 JEV_VIEW = os.environ.get("JEV_VIEW", "lines")
+# 纯 Jev 等级的提问方式：bare / rules / local，见 pure_prompt
+JEV_PROMPT = os.environ.get("JEV_PROMPT", "local")
 PORT = int(os.environ.get("PORT", "8765"))
 
 
@@ -311,15 +313,22 @@ def engine_move(board, me, use_jev):
     if a_val - b_val > max(CLOSE_ABS, abs(a_val) * CLOSE_REL):
         return done(a, f"两路分歧，但搜索评估 {lbl(b)}({b_val:+d}) 明显差于 {lbl(a)}({a_val:+d})，取搜索引擎")
 
-    criteria = {
-        lbl(a): f"Place at {lbl(a)}: choice of a depth-{a_depth} alpha-beta search engine "
-                f"(evaluation {a_val:+d} for you)",
-        lbl(b): f"Place at {lbl(b)}: choice of a threat-based engine ({b_why})",
-    }
-    result, err = ask_jev(board, me, criteria, (
-        "Two gomoku engines disagree about your next move. "
-        "Pick the move that gives you better winning chances."
-    ))
+    if JEV_PROMPT == "bare":
+        criteria = {
+            lbl(a): f"Place at {lbl(a)}: choice of a depth-{a_depth} alpha-beta search engine "
+                    f"(evaluation {a_val:+d} for you)",
+            lbl(b): f"Place at {lbl(b)}: choice of a threat-based engine ({b_why})",
+        }
+        instructions = ("Two gomoku engines disagree about your next move. "
+                        "Pick the move that gives you better winning chances.")
+    else:
+        # 与纯 Jev 相同的提问方式：通用规则 + 每个点四条线上的棋子
+        criteria = {lbl(m): f"Place a stone at {lbl(m)}. Stones around it — "
+                            f"{local_view(board, *divmod(m, SIZE))}" for m in (a, b)}
+        instructions = (RULES + " Both options are considered safe by an engine; "
+                        "prefer the one that builds more of your own open lines "
+                        "while limiting the opponent's.")
+    result, err = ask_jev(board, me, criteria, instructions)
     if not result:
         return done(a, f"两路分歧，Jev 调用失败（{err}），取搜索引擎")
     m = a if result["choice"] == lbl(a) else b
@@ -330,6 +339,43 @@ def engine_move(board, me, use_jev):
                              f"（置信度 {result['confidence']:.0%}）"}
 
 
+RULES = (
+    "Pick your next move in this gomoku game. Apply these rules in order: "
+    "1) if a move completes five of your stones in a row, play it; "
+    "2) otherwise, if the opponent could complete five on their next move, occupy that cell; "
+    "3) otherwise, if you can make an open four (four in a row with both ends empty), play it; "
+    "4) otherwise, if the opponent has an open three or a broken three, block one of its ends or its gap; "
+    "5) otherwise, extend your own longest line while keeping its ends open."
+)
+
+
+def local_view(board, r, c):
+    """(r,c) 四个方向各 4 格内的棋子，候选点记为 [坐标]。只描述棋盘内容，不做判断。"""
+    parts = []
+    for (dr, dc), name in LINE_DIRS:
+        seg = []
+        for k in range(-4, 5):
+            rr, cc = r + dr * k, c + dc * k
+            if not in_board(rr, cc):
+                continue
+            seg.append(f"[{label(rr, cc)}]" if k == 0 else f"{label(rr, cc)}{SYM[board[rr][cc]]}")
+        parts.append(f"{name}: {' '.join(seg)}")
+    return "; ".join(parts)
+
+
+def pure_prompt(board, me, cells):
+    """JEV_PROMPT: bare（只有坐标）/ rules（通用优先级规则）/ local（规则 + 每个点周围的棋子）。"""
+    if JEV_PROMPT == "bare":
+        return ({label(r, c): f"Place a stone at {label(r, c)}" for r, c in cells},
+                "Pick the strongest next move for you.")
+    if JEV_PROMPT == "rules":
+        return {label(r, c): f"Place a stone at {label(r, c)}" for r, c in cells}, RULES
+    return ({label(r, c): f"Place a stone at {label(r, c)}. Stones around it — "
+                          f"{local_view(board, r, c)}" for r, c in cells},
+            RULES + " Each option lists the stones on the four lines through that cell; "
+                    "the candidate cell is shown in brackets.")
+
+
 def pure_move(board, me):
     """纯 Jev：周围所有空点都给它选，不给提示、不做本地兜底，只在事后判定失误。"""
     opp = BLACK if me == WHITE else WHITE
@@ -337,8 +383,8 @@ def pure_move(board, me):
     wins = {label(r, c) for r, c in cells if is_five(board, r, c, me)}
     blocks = {label(r, c) for r, c in cells if is_five(board, r, c, opp)}
 
-    criteria = {label(r, c): f"Place a stone at {label(r, c)}" for r, c in cells}
-    result, err = ask_jev(board, me, criteria, "Pick the strongest next move for you.")
+    criteria, instructions = pure_prompt(board, me, cells)
+    result, err = ask_jev(board, me, criteria, instructions)
     if not result:
         _, r, c, _ = candidates(board, me, opp)[0]
         return r, c, {"source": "heuristic", "reason": err or "fallback"}
